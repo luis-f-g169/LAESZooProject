@@ -1,35 +1,8 @@
-import base64
-from io import BytesIO
-
-import torch
-import torch.nn as nn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from PIL import Image
-from torchvision import models, transforms
 
 app = FastAPI()
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Load your custom trained model
-path = '../models/animal_model_v2.pth'
-checkpoint = torch.load(path, map_location=device)
-categories = checkpoint["classes"]
-
-model = models.resnet18(weights=None)
-model.fc = nn.Linear(model.fc.in_features, len(categories))
-model.load_state_dict(checkpoint["model_state_dict"])
-model = model.to(device)
-model.eval()
-
-# Match your training preprocessing as closely as possible
-preprocess = transforms.Compose(
-    [
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-    ]
-)
 
 HTML = """
 <!doctype html>
@@ -75,42 +48,37 @@ HTML = """
 
   <div>
     <button id="startBtn">Start Camera</button>
-    <button id="streamBtn">Start Streaming</button>
-    <button id="stopBtn">Stop Streaming</button>
   </div>
 
-  <div id="result">Prediction: waiting...</div>
+  // You can customize these filters to better match the vision of each animal type
+
+  <div style="margin-top: 16px;">
+  <label for="visionSelect">Choose Animal Vision:</label>
+  <select id="visionSelect" style="font-size:16px; padding:10px; margin-left:8px;">
+    <option value="normal">Normal</option>
+    <option value="reptile">Alligator / Reptile</option>
+    <option value="bird">Bird</option>
+    <option value="mammal">Mammal</option>
+    <option value="primate">Primate</option>
+    <option value="bigcat">Big Cat</option>
+    <option value="canid">Canid / Dog-like</option>
+  </select>
+</div>
+
+  <div id="result">Selected Vision: Normal</div>
 
   <script>
-    const labelToFilter = {
-      "alligator_sinensis": "reptile",
-      "aonyx_cinereus": "mammal",
-      "cacatua_galerita": "bird",
-      "giraffa_camelopardalis_tippelskirchi": "mammal",
-      "gorilla_gorilla_gorilla": "primate",
-      "gymnogyps_californianus": "bird",
-      "hydrochoerus_hydrochaeris": "mammal",
-      "hylobates_lar": "primate",
-      "macropus_fuliginosus": "mammal",
-      "notamacropus_rufogriseus": "mammal",
-      "panthera_leo": "bigcat",
-      "panthera_pardus_orientalis": "bigcat",
-      "panthera_uncia": "bigcat",
-      "phoenicopterus_chilensis": "bird",
-      "podargus_strigoides": "bird",
-      "urocyon_littoralis": "canid"
-    };
+
     const video = document.getElementById("video");
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
     const statusEl = document.getElementById("status");
     const resultEl = document.getElementById("result");
 
-    let ws = null;
+    const visionSelect = document.getElementById("visionSelect");
+
     let stream = null;
-    let intervalId = null;
     let currentFilter = "normal";
-    let lastLabel = "none";
 
     async function startCamera() {
       try {
@@ -138,34 +106,10 @@ HTML = """
       }
     }
 
-    function connectWS() {
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/ws`);
-
-      ws.onopen = () => {
-        statusEl.textContent = "WebSocket connected";
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-
-          if (data.label) {
-            resultEl.textContent = `Prediction: ${data.label} (${data.confidence.toFixed(1)}%)`;
-            lastLabel = data.label.toLowerCase();
-            currentFilter = labelToFilter[lastLabel] || "normal";
-          } else if (data.error) {
-            resultEl.textContent = "Error: " + data.error;
-          }
-        } catch (err) {
-          resultEl.textContent = "Parse error: " + err.message;
-        }
-      };
-
-      ws.onclose = () => {
-        statusEl.textContent = "WebSocket closed";
-      };
-    }
+  visionSelect.onchange = () => {
+    currentFilter = visionSelect.value;
+    resultEl.textContent = `Selected Vision: ${visionSelect.options[visionSelect.selectedIndex].text}`;
+  };
 
 function applyFilter(imageData, filterName) {
   const data = imageData.data;
@@ -256,38 +200,7 @@ function applyFilter(imageData, filterName) {
     }
 
     document.getElementById("startBtn").onclick = async () => {
-      const ok = await startCamera();
-      if (ok && (!ws || ws.readyState !== WebSocket.OPEN)) {
-        connectWS();
-      }
-    };
-
-    document.getElementById("streamBtn").onclick = async () => {
-      let ok = true;
-
-      if (!stream) {
-        ok = await startCamera();
-      }
-
-      if (!ok) {
-        statusEl.textContent = "Cannot stream: camera not available";
-        return;
-      }
-
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        connectWS();
-      }
-
-      if (intervalId) clearInterval(intervalId);
-      intervalId = setInterval(sendFrame, 400);
-
-      statusEl.textContent = "Streaming frames...";
-    };
-
-    document.getElementById("stopBtn").onclick = () => {
-      if (intervalId) clearInterval(intervalId);
-      intervalId = null;
-      statusEl.textContent = "Streaming stopped";
+      await startCamera();
     };
 
     renderLoop();
@@ -300,39 +213,3 @@ function applyFilter(imageData, filterName) {
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return HTML
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        while True:
-            data_url = await websocket.receive_text()
-
-            if "," not in data_url:
-                await websocket.send_json({"error": "Bad frame format"})
-                continue
-
-            _, encoded = data_url.split(",", 1)
-            image_bytes = base64.b64decode(encoded)
-            image = Image.open(BytesIO(image_bytes)).convert("RGB")
-
-            x = preprocess(image).unsqueeze(0).to(device)
-
-            with torch.no_grad():
-                logits = model(x)
-                probs = torch.nn.functional.softmax(logits[0], dim=0)
-                top_prob, top_idx = torch.max(probs, dim=0)
-
-            label = categories[top_idx.item()]
-            confidence = float(top_prob.item()) * 100.0
-
-            await websocket.send_json({"label": label, "confidence": confidence})
-
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        try:
-            await websocket.send_json({"error": str(e)})
-        except Exception:
-            pass
