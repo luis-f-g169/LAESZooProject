@@ -62,6 +62,7 @@ HTML = """
     <option value="primate">Primate</option>
     <option value="bigcat">Big Cat</option>
     <option value="canid">Canid / Dog-like</option>
+    <option value="fiji">Fiji Banded Iguana</option>
   </select>
 </div>
 
@@ -79,6 +80,10 @@ HTML = """
 
     let stream = null;
     let currentFilter = "normal";
+
+    // Offscreen canvases reused each frame for the Fiji vignette-blur effect
+    let fijiBlurCanvas = null;
+    let fijiMaskCanvas = null;
 
     async function startCamera() {
       try {
@@ -110,6 +115,69 @@ HTML = """
     currentFilter = visionSelect.value;
     resultEl.textContent = `Selected Vision: ${visionSelect.options[visionSelect.selectedIndex].text}`;
   };
+
+// ── HSL helpers ──────────────────────────────────────────────────────────────
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h;
+  if      (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+  else if (max === g) h = ((b - r) / d + 2) / 6;
+  else                h = ((r - g) / d + 4) / 6;
+  return [h, s, l];
+}
+
+function hslToRgb(h, s, l) {
+  if (s === 0) { const v = Math.round(l * 255); return [v, v, v]; }
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  function hue2rgb(t) {
+    if (t < 0) t += 1; if (t > 1) t -= 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 0.5)   return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  }
+  return [
+    Math.round(hue2rgb(h + 1 / 3) * 255),
+    Math.round(hue2rgb(h)         * 255),
+    Math.round(hue2rgb(h - 1 / 3) * 255)
+  ];
+}
+
+// ── Barrel distortion (fisheye) pixel remap ───────────────────────────────────
+// k > 0 → barrel (fisheye / wide-angle look); corresponds to Bulge –60%
+function applyBarrelDistortion(imageData, k) {
+  const w = imageData.width, h = imageData.height;
+  const src = new Uint8ClampedArray(imageData.data);
+  const dst = imageData.data;
+  const cx = w / 2, cy = h / 2;
+  for (let py = 0; py < h; py++) {
+    for (let px = 0; px < w; px++) {
+      const xn = (px - cx) / cx;
+      const yn = (py - cy) / cy;
+      const rr = Math.sqrt(xn * xn + yn * yn);
+      const di = (py * w + px) * 4;
+      if (rr < 0.0001) continue;              // centre pixel unchanged
+      const rSrc = rr / (1 + k * rr * rr);   // inverse barrel mapping
+      const sx = Math.round(xn / rr * rSrc * cx + cx);
+      const sy = Math.round(yn / rr * rSrc * cy + cy);
+      if (sx >= 0 && sx < w && sy >= 0 && sy < h) {
+        const si = (sy * w + sx) * 4;
+        dst[di]     = src[si];
+        dst[di + 1] = src[si + 1];
+        dst[di + 2] = src[si + 2];
+      } else {
+        dst[di] = dst[di + 1] = dst[di + 2] = 0;
+      }
+    }
+  }
+  return imageData;
+}
 
 function applyFilter(imageData, filterName) {
   const data = imageData.data;
@@ -160,6 +228,39 @@ function applyFilter(imageData, filterName) {
       data[i]     = 0.75 * r + 0.25 * gray;
       data[i + 1] = 0.75 * g + 0.25 * gray;
       data[i + 2] = 0.75 * b + 0.25 * gray;
+
+    } else if (filterName === "fiji") {
+      // === Fiji Banded Iguana Vision ===
+      // Hue +20°, Saturation +20, Lightness +10, Shadows –15, Contrast –20
+      // Fisheye barrel distortion + vignette blur handled in renderLoop
+
+      // HSL adjustments
+      let [hF, sF, lF] = rgbToHsl(r, g, b);
+      hF = (hF + 20 / 360) % 1;       // Hue +20°
+      sF = Math.min(1, sF + 0.20);     // Saturation +20
+      lF = Math.min(1, lF + 0.10);     // Lightness +10
+      let [rF, gF, bF] = hslToRgb(hF, sF, lF);
+
+      // Shadows –15: darken pixels below mid-luminance
+      const lumF = 0.299 * rF + 0.587 * gF + 0.114 * bF;
+      const shadowAdj = -15 * Math.max(0, 1 - lumF / 128);
+      rF = Math.max(0, rF + shadowAdj);
+      gF = Math.max(0, gF + shadowAdj);
+      bF = Math.max(0, bF + shadowAdj);
+
+      // Contrast –20: pull all tones toward midgray (128)
+      rF = 128 + (rF - 128) * 0.80;
+      gF = 128 + (gF - 128) * 0.80;
+      bF = 128 + (bF - 128) * 0.80;
+
+      // Exposure –20: uniform darkening across all tones
+      rF -= 20;
+      gF -= 20;
+      bF -= 20;
+
+      data[i]     = Math.min(255, Math.max(0, rF));
+      data[i + 1] = Math.min(255, Math.max(0, gF));
+      data[i + 2] = Math.min(255, Math.max(0, bF));
     }
   }
 
@@ -175,7 +276,53 @@ function applyFilter(imageData, filterName) {
 
         let frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
         frame = applyFilter(frame, currentFilter);
+
+        if (currentFilter === "fiji") {
+          // Fisheye barrel distortion
+          frame = applyBarrelDistortion(frame, 0.2);
+        }
+
         ctx.putImageData(frame, 0, 0);
+
+        if (currentFilter === "fiji") {
+          const w = canvas.width;
+          const h = canvas.height;
+
+          // ── Vignette blur: sharp centre, blurred edges ──────────────────────
+          // Lazily build (or rebuild on resize) the two helper canvases
+          if (!fijiBlurCanvas || fijiBlurCanvas.width !== w || fijiBlurCanvas.height !== h) {
+            fijiBlurCanvas = document.createElement("canvas");
+            fijiBlurCanvas.width = w;
+            fijiBlurCanvas.height = h;
+
+            fijiMaskCanvas = document.createElement("canvas");
+            fijiMaskCanvas.width = w;
+            fijiMaskCanvas.height = h;
+
+            // Static radial mask: transparent centre → opaque at edges
+            const mCtx = fijiMaskCanvas.getContext("2d");
+            const radMask = mCtx.createRadialGradient(w / 2, h / 2, h * 0.25, w / 2, h / 2, h * 0.60);
+            radMask.addColorStop(0, "rgba(0,0,0,0)");
+            radMask.addColorStop(1, "rgba(0,0,0,1)");
+            mCtx.fillStyle = radMask;
+            mCtx.fillRect(0, 0, w, h);
+          }
+
+          // Draw blurred copy of current frame onto fijiBlurCanvas
+          const bCtx = fijiBlurCanvas.getContext("2d");
+          bCtx.clearRect(0, 0, w, h);
+          bCtx.filter = "blur(7px)";
+          bCtx.drawImage(canvas, 0, 0);
+          bCtx.filter = "none";
+
+          // Mask blurred copy so only the edge ring shows through
+          bCtx.globalCompositeOperation = "destination-in";
+          bCtx.drawImage(fijiMaskCanvas, 0, 0);
+          bCtx.globalCompositeOperation = "source-over";
+
+          // Composite the masked blur over the sharp canvas
+          ctx.drawImage(fijiBlurCanvas, 0, 0);
+        }
       }
 
       requestAnimationFrame(renderLoop);
